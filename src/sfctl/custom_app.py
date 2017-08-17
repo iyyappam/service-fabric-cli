@@ -97,31 +97,7 @@ def upload(path, show_progress=False, upload_timeout=None):  # pylint: disable=t
         upload_timeout = int(upload_timeout)
     endpoint = client_endpoint()
     cert = cert_info()
-    if cert:
-        # As a workaround we prompt for password input here, then store the
-        # password in memory. This is required as Service Fabric appears to
-        # terminate connections early, thus requiring multiple password inputs
-        # otherwise
-        class PasswordContext(requests.packages.urllib3.contrib.pyopenssl.OpenSSL.SSL.Context):  # pylint: disable=line-too-long,no-member,too-few-public-methods
-            """Custom password context for handling x509 passphrases"""
-
-            def __init__(self, method):
-                super(PasswordContext, self).__init__(method)
-                self.passphrase = None
-
-                def passwd_cb(maxlen, prompt_twice, userdata):
-                    """Password retrival callback"""
-                    if self.passphrase is None:
-                        self.passphrase = getpass('Enter cert pass phrase: ')
-                    if len(self.passphrase) < maxlen:
-                        return self.passphrase
-                    return ''
-                self.set_passwd_cb(passwd_cb)
-
-        # Monkey-patch the subclass into OpenSSL.SSL so it is used in place of
-        # the stock version
-        requests.packages.urllib3.contrib.pyopenssl.OpenSSL.SSL.Context = PasswordContext  # pylint: disable=line-too-long,no-member
-
+    cert_passphrase = {'pass': None}
     ca_cert = True
     if no_verify_setting():
         ca_cert = False
@@ -131,6 +107,58 @@ def upload(path, show_progress=False, upload_timeout=None):  # pylint: disable=t
     if all([no_verify_setting(), ca_cert_info()]):
         raise CLIError('Cannot specify both CA cert info and no verify')
 
+    # WARN: The next section of code is obnoxiously complicated, please
+    # consult author for any changes
+    if cert:
+
+        # We prompt for password input here, then store the
+        # password in memory. This is required to share the password across
+        # threads
+
+        # First we need to get the password
+        class GetPasswordContext(requests.packages.urllib3.contrib.pyopenssl.OpenSSL.SSL.Context):  # pylint: disable=line-too-long,no-member,too-few-public-methods
+            """Custom password context for handling x509 passphrases"""
+
+            def __init__(self, method):
+                super(GetPasswordContext, self).__init__(method)
+                self.passphrase = None
+
+                def passwd_cb(maxlen, prompt_twice, userdata):
+                    """Password retrival callback"""
+                    if self.passphrase is None:
+                        self.passphrase = getpass('Enter cert pass phrase: ')
+                        userdata['pass'] = self.passphrase
+                    if len(self.passphrase) < maxlen:
+                        return self.passphrase
+                    return ''
+                self.set_passwd_cb(passwd_cb, cert_passphrase)
+
+        # Monkey-patch the subclass into OpenSSL.SSL so it is used in place of
+        # the stock version
+        requests.packages.urllib3.contrib.pyopenssl.OpenSSL.SSL.Context = GetPasswordContext  # pylint: disable=line-too-long,no-member
+
+        # Make a request to check for pass phrase protected cert first,
+        # prior to file uploads
+        requests.get(endpoint, cert=cert, verify=ca_cert)
+
+        # Then we an replace with a different context that uses the password
+        class SetPasswordContext(requests.packages.urllib3.contrib.pyopenssl.OpenSSL.SSL.Context):  # pylint: disable=line-too-long,no-member,too-few-public-methods
+            """Custom password context for handling x509 passphrases"""
+
+            def __init__(self, method):
+                super(SetPasswordContext, self).__init__(method)
+                def passwd_cb(maxlen, prompt_twice, userdata):
+                    """Password retrival callback"""
+                    if len(cert_passphrase['pass']) < maxlen:
+                        return cert_passphrase['pass']
+                    return ''
+                self.set_passwd_cb(passwd_cb)
+
+        # Monkey-patch the subclass into OpenSSL.SSL so it is used in place of
+        # the stock version
+        requests.packages.urllib3.contrib.pyopenssl.OpenSSL.SSL.Context = SetPasswordContext  # pylint: disable=line-too-long,no-member
+    # End WARN
+
     total_files_count = 0
     current_files_count = {'val': 0}
     total_files_size = 0
@@ -138,9 +166,9 @@ def upload(path, show_progress=False, upload_timeout=None):  # pylint: disable=t
 
     for root, _, files in os.walk(abspath):
         total_files_count += (len(files) + 1)
-        for f in files:
-            t = os.stat(os.path.join(root, f))
-            total_files_size += t.st_size
+        for cur_file in files:
+            cur_stat = os.stat(os.path.join(root, cur_file))
+            total_files_size += cur_stat.st_size
 
     def print_progress(size, rel_file_path):
         """Display progress for uploading"""
@@ -152,14 +180,6 @@ def upload(path, show_progress=False, upload_timeout=None):  # pylint: disable=t
                 current_files_size['size'],
                 total_files_size,
                 rel_file_path), file=sys.stderr)
-
-    sesh = resquest.Session()
-    sesh.verify = ca_cert
-    sesh.cert = cert
-
-    # Make a request to check for pass phrase protected cert first,
-    # prior to file uploads
-    sesh.get(endpoint)
 
     def upload_file(root, rel_path, f):
         """Upload individual file using specified session"""
@@ -186,7 +206,7 @@ def upload(path, show_progress=False, upload_timeout=None):  # pylint: disable=t
             fc_iter = file_chunk(file_opened, os.path.normpath(
                 os.path.join(rel_path, f)
             ), print_progress)
-            sesh.put(url, data=fc_iter)
+            requests.put(url, data=fc_iter, cert=cert, verify=ca_cert)
             current_files_count['val'] += 1
             print_progress(0, os.path.normpath(os.path.join(rel_path, f)))
 
@@ -198,7 +218,7 @@ def upload(path, show_progress=False, upload_timeout=None):  # pylint: disable=t
         url_parsed[2] = url_path
         url_parsed[4] = urlencode({"api-version": "3.0-preview"})
         url = urlunparse(url_parsed)
-        sesh.put(url)
+        requests.put(url, cert=cert, verify=ca_cert)
         current_files_count['val'] += 1
         print_progress(0, os.path.normpath(os.path.join(rel_path, '_.dir')))
 
