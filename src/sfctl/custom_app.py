@@ -67,16 +67,16 @@ def validate_app_path(app_path):
         )
 
 
-def upload(path, show_progress=False):  # pylint: disable=too-many-locals
+def upload(path, show_progress=False, upload_timeout=None):  # pylint: disable=too-many-locals
     """
-    Copies a Service Fabric application package to the image store.
-    The cmdlet copies a Service Fabric application package to the image store.
-    After copying the application package, use the sf application provision
-    cmdlet to register the application type.
-    Can optionally display upload progress for each file in the package.
-    Upload progress is sent to `stderr`.
+    Copies a Service Fabric application package, in the form of a directory,
+    to the image store. Can optionally display upload progress for each file
+    in the package. Upload progress is sent to `stderr`. Files are uploaded in
+    parallel
     :param str path: The path to your local application package
     :param bool show_progress: Show file upload progress
+    :param int upload_timeout: Set a timeout for all uploads to complete,
+    measured in seconds.
     """
     from sfctl.config import (client_endpoint, no_verify_setting, ca_cert_info,
                               cert_info)
@@ -207,7 +207,7 @@ def upload(path, show_progress=False):  # pylint: disable=too-many-locals
                         upload_file, root, rel_path, f, sesh))
                 futures.append(executor.submit(
                     upload_dir_file, rel_path, sesh))
-            (_, not_done) = wait(futures)
+            (_, not_done) = wait(futures, upload_timeout)
 
             if not_done:
                 for failed in not_done:
