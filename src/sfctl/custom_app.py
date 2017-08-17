@@ -13,6 +13,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, wait
 from knack.util import CLIError
 
+
 def create_compose_application(client, compose_file, application_id,
                                repo_user=None, encrypted=False,
                                repo_pass=None, timeout=60):
@@ -28,7 +29,7 @@ def create_compose_application(client, compose_file, application_id,
     rather than prompting for a plaintext one
     :param str repo_pass: Encrypted container repository password
     """
-    from azure.servicefabric.models.create_compose_application_description import CreateComposeApplicationDescription # pylint: disable=line-too-long
+    from azure.servicefabric.models.create_compose_application_description import CreateComposeApplicationDescription  # pylint: disable=line-too-long
     from azure.servicefabric.models.repository_credential import (
         RepositoryCredential
     )
@@ -92,6 +93,8 @@ def upload(path, show_progress=False, upload_timeout=None):  # pylint: disable=t
     abspath = validate_app_path(path)
     basename = os.path.basename(abspath)
 
+    if upload_timeout:
+        upload_timeout = int(upload_timeout)
     endpoint = client_endpoint()
     cert = cert_info()
     if cert:
@@ -99,8 +102,9 @@ def upload(path, show_progress=False, upload_timeout=None):  # pylint: disable=t
         # password in memory. This is required as Service Fabric appears to
         # terminate connections early, thus requiring multiple password inputs
         # otherwise
-        class PasswordContext(requests.packages.urllib3.contrib.pyopenssl.OpenSSL.SSL.Context): #pylint: disable=line-too-long,no-member,too-few-public-methods
+        class PasswordContext(requests.packages.urllib3.contrib.pyopenssl.OpenSSL.SSL.Context):  # pylint: disable=line-too-long,no-member,too-few-public-methods
             """Custom password context for handling x509 passphrases"""
+
             def __init__(self, method):
                 super(PasswordContext, self).__init__(method)
                 self.passphrase = None
@@ -116,7 +120,7 @@ def upload(path, show_progress=False, upload_timeout=None):  # pylint: disable=t
 
         # Monkey-patch the subclass into OpenSSL.SSL so it is used in place of
         # the stock version
-        requests.packages.urllib3.contrib.pyopenssl.OpenSSL.SSL.Context = PasswordContext #pylint: disable=line-too-long,no-member
+        requests.packages.urllib3.contrib.pyopenssl.OpenSSL.SSL.Context = PasswordContext  # pylint: disable=line-too-long,no-member
 
     ca_cert = True
     if no_verify_setting():
@@ -149,7 +153,15 @@ def upload(path, show_progress=False, upload_timeout=None):  # pylint: disable=t
                 total_files_size,
                 rel_file_path), file=sys.stderr)
 
-    def upload_file(root, rel_path, f, session):
+    sesh = resquest.Session()
+    sesh.verify = ca_cert
+    sesh.cert = cert
+
+    # Make a request to check for pass phrase protected cert first,
+    # prior to file uploads
+    sesh.get(endpoint)
+
+    def upload_file(root, rel_path, f):
         """Upload individual file using specified session"""
         url_path = os.path.normpath(
             os.path.join(
@@ -174,11 +186,11 @@ def upload(path, show_progress=False, upload_timeout=None):  # pylint: disable=t
             fc_iter = file_chunk(file_opened, os.path.normpath(
                 os.path.join(rel_path, f)
             ), print_progress)
-            session.put(url, data=fc_iter)
+            sesh.put(url, data=fc_iter)
             current_files_count['val'] += 1
             print_progress(0, os.path.normpath(os.path.join(rel_path, f)))
 
-    def upload_dir_file(rel_path, session):
+    def upload_dir_file(rel_path):
         """Upload individual directory using specified session"""
         url_path = os.path.normpath(os.path.join(
             "ImageStore", basename, rel_path, "_.dir")).replace("\\", "/")
@@ -186,34 +198,26 @@ def upload(path, show_progress=False, upload_timeout=None):  # pylint: disable=t
         url_parsed[2] = url_path
         url_parsed[4] = urlencode({"api-version": "3.0-preview"})
         url = urlunparse(url_parsed)
-        session.put(url)
+        sesh.put(url)
         current_files_count['val'] += 1
         print_progress(0, os.path.normpath(os.path.join(rel_path, '_.dir')))
 
-    with requests.Session() as sesh:
-        sesh.verify = ca_cert
-        sesh.cert = cert
-
-        # Make a request to check for pass phrase protected cert first,
-        # prior to file uploads
-        sesh.get(endpoint)
-
-        with ThreadPoolExecutor() as executor:
-            futures = []
-            for root, _, files in os.walk(abspath):
-                rel_path = os.path.normpath(os.path.relpath(root, abspath))
-                for f in files:
-                    futures.append(executor.submit(
-                        upload_file, root, rel_path, f, sesh))
+    with ThreadPoolExecutor() as executor:
+        futures = []
+        for root, _, files in os.walk(abspath):
+            rel_path = os.path.normpath(os.path.relpath(root, abspath))
+            for f in files:
                 futures.append(executor.submit(
-                    upload_dir_file, rel_path, sesh))
-            (_, not_done) = wait(futures, timeout=upload_timeout)
+                    upload_file, root, rel_path, f))
+            futures.append(executor.submit(
+                upload_dir_file, rel_path))
+        (_, not_done) = wait(futures, timeout=upload_timeout)
 
-            if not_done:
-                for failed in not_done:
-                    failed.exception()
-                raise CLIError('Some uploads failed')
-        print_progress(0, 'Done without errors')
+        if not_done:
+            for failed in not_done:
+                failed.exception()
+            raise CLIError('Some uploads failed')
+    print_progress(0, 'Done without errors')
 
 def parse_app_params(formatted_params):
     """Parse application parameters from string"""
