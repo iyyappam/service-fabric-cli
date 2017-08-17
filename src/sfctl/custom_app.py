@@ -10,6 +10,7 @@ from __future__ import print_function
 
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, wait
 from knack.util import CLIError
 
 def create_compose_application(client, compose_file, application_id,
@@ -126,82 +127,83 @@ def upload(path, show_progress=False):  # pylint: disable=too-many-locals
     if all([no_verify_setting(), ca_cert_info()]):
         raise CLIError('Cannot specify both CA cert info and no verify')
 
+    total_files_count = 0
+    current_files_count = {'val': 0}
+    total_files_size = 0
+    current_files_size = {'size': 0}
+
+    def print_progress(size, rel_file_path):
+        """Display progress for uploading"""
+        current_files_size['size'] += size
+        if show_progress:
+            print('[{}/{}] files, [{}/{}] bytes, {}'.format(
+                current_files_count['val'],
+                total_files_count,
+                current_files_size['size'],
+                total_files_size,
+                rel_file_path), file=sys.stderr)
+
+    def upload_file(root, rel_path, f, session):
+        """Upload individual file using specified session"""
+        url_path = os.path.normpath(
+            os.path.join(
+                "ImageStore", basename, rel_path, f)).replace("\\", "/")
+        full_path = os.path.normpath(os.path.join(root, f))
+        with open(full_path, 'rb') as file_opened:
+            url_parsed = list(urlparse(endpoint))
+            url_parsed[2] = url_path
+            url_parsed[4] = urlencode(
+                {"api-version": "3.0-preview"})
+            url = urlunparse(url_parsed)
+
+            def file_chunk(target_file, rel_path, print_progress):
+                """Yield partial chunks of file contents"""
+                chunk = True
+                while chunk:
+                    chunk = target_file.read(1000000)
+                    if chunk:
+                        print_progress(len(chunk), rel_path)
+                    yield chunk
+
+            fc_iter = file_chunk(file_opened, os.path.normpath(
+                os.path.join(rel_path, f)
+            ), print_progress)
+            session.put(url, data=fc_iter)
+            current_files_count['val'] += 1
+            print_progress(0, os.path.normpath(os.path.join(rel_path, f)))
+
+    def upload_dir_file(rel_path, session):
+        """Upload individual directory using specified session"""
+        url_path = os.path.normpath(os.path.join(
+            "ImageStore", basename, rel_path, "_.dir")).replace("\\", "/")
+        url_parsed = list(urlparse(endpoint))
+        url_parsed[2] = url_path
+        url_parsed[4] = urlencode({"api-version": "3.0-preview"})
+        url = urlunparse(url_parsed)
+        session.put(url)
+        current_files_count['val'] += 1
+        print_progress(0, os.path.normpath(os.path.join(rel_path, '_.dir')))
+
     with requests.Session() as sesh:
         sesh.verify = ca_cert
         sesh.cert = cert
 
-        total_files_count = 0
-        current_files_count = 0
-        total_files_size = 0
-        current_files_size = {'size': 0}
+        with ThreadPoolExecutor() as executor:
+            futures = []
+            for root, _, files in os.walk(abspath):
+                rel_path = os.path.normpath(os.path.relpath(root, abspath))
+                for f in files:
+                    futures.append(executor.submit(
+                        upload_file, root, rel_path, f, sesh))
+                futures.append(executor.submit(
+                    upload_dir_file, rel_path, sesh))
+            (_, not_done) = wait(futures)
 
-        for root, _, files in os.walk(abspath):
-            total_files_count += (len(files) + 1)
-            for f in files:
-                t_stat = os.stat(os.path.join(root, f))
-                total_files_size += t_stat.st_size
-
-        def print_progress(size, rel_file_path):
-            """Display progress for uploading"""
-            current_files_size['size'] += size
-            if show_progress:
-                print(
-                    '[{}/{}] files, [{}/{}] bytes, {}'.format(
-                        current_files_count,
-                        total_files_count,
-                        current_files_size["size"],
-                        total_files_size,
-                        rel_file_path), file=sys.stderr)
-
-        for root, _, files in os.walk(abspath):
-            rel_path = os.path.normpath(os.path.relpath(root, abspath))
-            for f in files:
-                url_path = (
-                    os.path.normpath(os.path.join('ImageStore', basename,
-                                                  rel_path, f))
-                ).replace('\\', '/')
-                fp_norm = os.path.normpath(os.path.join(root, f))
-                with open(fp_norm, 'rb') as file_opened:
-                    url_parsed = list(urlparse(endpoint))
-                    url_parsed[2] = url_path
-                    url_parsed[4] = urlencode(
-                        {'api-version': '3.0-preview'})
-                    url = urlunparse(url_parsed)
-
-                    def file_chunk(target_file, rel_path, print_progress):
-                        """Yield partial chunks of file contents"""
-                        chunk = True
-                        while chunk:
-                            chunk = target_file.read(100000)
-                            print_progress(len(chunk), rel_path)
-                            yield chunk
-
-                    fc_iter = file_chunk(file_opened, os.path.normpath(
-                        os.path.join(rel_path, f)), print_progress)
-                    sesh.put(url, data=fc_iter)
-                    current_files_count += 1
-                    print_progress(0, os.path.normpath(
-                        os.path.join(rel_path, f)
-                    ))
-            url_path = (
-                os.path.normpath(os.path.join('ImageStore', basename,
-                                              rel_path, '_.dir'))
-            ).replace('\\', '/')
-            url_parsed = list(urlparse(endpoint))
-            url_parsed[2] = url_path
-            url_parsed[4] = urlencode({'api-version': '3.0-preview'})
-            url = urlunparse(url_parsed)
-            sesh.put(url)
-            current_files_count += 1
-            print_progress(0,
-                           os.path.normpath(os.path.join(rel_path, '_.dir')))
-
-        if show_progress:
-            print('[{}/{}] files, [{}/{}] bytes sent'.format(
-                current_files_count,
-                total_files_count,
-                current_files_size['size'],
-                total_files_size), file=sys.stderr)
+            if not_done:
+                for failed in not_done:
+                    failed.exception()
+                raise CLIError('Some uploads failed')
+        print_progress(0, 'Done without errors')
 
 def parse_app_params(formatted_params):
     """Parse application parameters from string"""

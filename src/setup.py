@@ -46,7 +46,8 @@ setup(
         'msrest',
         'requests',
         'azure-servicefabric==5.6.130',
-        'pyopenssl'
+        'pyopenssl',
+        'futures'
     ],
     extras_require={
         'test': [
