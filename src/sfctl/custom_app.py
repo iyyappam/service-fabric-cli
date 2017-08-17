@@ -132,6 +132,12 @@ def upload(path, show_progress=False):  # pylint: disable=too-many-locals
     total_files_size = 0
     current_files_size = {'size': 0}
 
+    for root, _, files in os.walk(abspath):
+        total_files_count += (len(files) + 1)
+        for f in files:
+            t = os.stat(os.path.join(root, f))
+            total_files_size += t.st_size
+
     def print_progress(size, rel_file_path):
         """Display progress for uploading"""
         current_files_size['size'] += size
@@ -187,6 +193,10 @@ def upload(path, show_progress=False):  # pylint: disable=too-many-locals
     with requests.Session() as sesh:
         sesh.verify = ca_cert
         sesh.cert = cert
+
+        # Make a request to check for pass phrase protected cert first,
+        # prior to file uploads
+        sesh.get(endpoint)
 
         with ThreadPoolExecutor() as executor:
             futures = []
