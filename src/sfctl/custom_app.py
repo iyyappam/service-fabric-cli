@@ -207,7 +207,7 @@ def upload(path, show_progress=False, upload_timeout=None):  # pylint: disable=t
                         upload_file, root, rel_path, f, sesh))
                 futures.append(executor.submit(
                     upload_dir_file, rel_path, sesh))
-            (_, not_done) = wait(futures, upload_timeout)
+            (_, not_done) = wait(futures, timeout=upload_timeout)
 
             if not_done:
                 for failed in not_done:
